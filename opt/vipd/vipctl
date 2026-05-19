@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+vipctl - CLI für vipd
+
+Subcommands:
+  status              Status aller Nodes + aller VIPs (sammelt von lokal + Peers)
+  check <vip>         Manuellen Health-Check für eine VIP ausführen (Detail-Output)
+  release <vip>       Lokale Node gibt die VIP frei
+  takeover <vip>      Lokale Node übernimmt die VIP (oder eine andere mit --node)
+  failover <vip>      Aktueller Halter gibt frei -> Default-Master übernimmt
+                      (wenn dieser lebt; sonst der nächste verfügbare Peer)
+
+Optionen:
+  --node <name>       Aktion auf Remote-Node ausführen (statt lokal)
+  --config <path>     Pfad zur vipd.yaml (Default: /etc/vipd/vipd.yaml)
+  --json              Output als JSON
+  -v, --verbose       Mehr Details
+
+Aufruf-Beispiele:
+  vipctl status
+  vipctl status --json
+  vipctl check web-vip
+  vipctl release web-vip                  # auf dieser Node
+  vipctl release web-vip --node lb02      # auf lb02 (per Peer-API)
+  vipctl takeover web-vip --node lb01     # lb01 soll web-vip übernehmen
+  vipctl failover web-vip                 # geordnetes Umschalten zum Default-Master
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+import httpx
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Config laden (nur die Felder, die wir hier brauchen)
+# ---------------------------------------------------------------------------
+class CtlConfig:
+    def __init__(self, path: str):
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        self.node_name: str = data["node_name"]
+        self.listen_port: int = data.get("listen_port", 8443)
+        self.ca_file: str = data.get("ca_file", "/etc/vipd/ca.pem")
+        self.secrets_file: str = data.get("secrets_file", "/etc/vipd/secrets")
+        # Peers: name -> (internal_ip, external_ip)
+        self.peers: dict[str, tuple[str, str]] = {}
+        for p in data.get("peers", []):
+            self.peers[p["name"]] = (p["internal_ip"], p["external_ip"])
+        # VIPs nur für default_master-Lookup
+        self.vips: dict[str, dict] = {}
+        for v in data.get("vips", []):
+            self.vips[v["name"]] = v
+
+        # Auth-Token aus Secrets
+        with open(self.secrets_file, "r") as f:
+            secrets = yaml.safe_load(f)
+        self.auth_token: str = secrets["auth_token"]
+
+    def node_url(self, node_name: str) -> Optional[str]:
+        """Liefert die Basis-URL für eine Node. None wenn unbekannt.
+        Bevorzugt internes Netz, fällt auf externes zurück (wird beim Call entschieden).
+        """
+        if node_name == self.node_name:
+            return f"https://127.0.0.1:{self.listen_port}"
+        if node_name in self.peers:
+            internal_ip, _ = self.peers[node_name]
+            return f"https://{internal_ip}:{self.listen_port}"
+        return None
+
+    def node_fallback_url(self, node_name: str) -> Optional[str]:
+        """Fallback-URL über externe IP."""
+        if node_name == self.node_name:
+            return None
+        if node_name in self.peers:
+            _, external_ip = self.peers[node_name]
+            return f"https://{external_ip}:{self.listen_port}"
+        return None
+
+    def all_node_names(self) -> list[str]:
+        """Alle Nodes inkl. lokaler."""
+        return [self.node_name] + list(self.peers.keys())
+
+
+# ---------------------------------------------------------------------------
+# HTTP-Helper
+# ---------------------------------------------------------------------------
+def _client(cfg: CtlConfig) -> httpx.Client:
+    # verify=ca_file: Cert wird gegen internes CA geprüft.
+    # Für 127.0.0.1 funktioniert die Cert-Validierung evtl. nicht, weil der
+    # Cert auf einen anderen Hostname läuft -> wir fallen dann auf verify=False
+    # zurück (im _call). Hier erstmal mit CA.
+    return httpx.Client(verify=cfg.ca_file, timeout=5.0)
+
+
+def _call(cfg: CtlConfig, method: str, node_name: str, path: str,
+          verbose: bool = False) -> Optional[dict]:
+    """Macht einen authentifizierten API-Call gegen die Node. None = Fehler.
+    Versucht erst über internes Netz, dann über externe IP.
+    Für 127.0.0.1 wird TLS-Verify abgeschaltet (Cert läuft auf externen Namen).
+    """
+    headers = {"Authorization": f"Bearer {cfg.auth_token}"}
+
+    candidates = []
+    primary = cfg.node_url(node_name)
+    if primary:
+        candidates.append(primary)
+    fallback = cfg.node_fallback_url(node_name)
+    if fallback:
+        candidates.append(fallback)
+
+    if not candidates:
+        print(f"FEHLER: Node '{node_name}' nicht in Config", file=sys.stderr)
+        return None
+
+    last_err = None
+    for url_base in candidates:
+        url = url_base + path
+        verify: bool | str
+        if "127.0.0.1" in url_base or "localhost" in url_base:
+            verify = False
+        else:
+            verify = cfg.ca_file
+        if verbose:
+            print(f"-> {method} {url}  (verify={verify})", file=sys.stderr)
+        try:
+            with httpx.Client(verify=verify, timeout=5.0) as client:
+                if method == "GET":
+                    r = client.get(url, headers=headers)
+                else:
+                    r = client.request(method, url, headers=headers)
+            if r.status_code == 200:
+                return r.json()
+            last_err = f"HTTP {r.status_code}: {r.text}"
+        except httpx.HTTPError as e:
+            last_err = f"{e.__class__.__name__}: {e}"
+
+    if verbose:
+        print(f"   Fehler: {last_err}", file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+def cmd_status(cfg: CtlConfig, args: argparse.Namespace) -> int:
+    """Sammelt /status von allen Nodes und stellt eine Gesamtübersicht zusammen."""
+    results: dict[str, Optional[dict]] = {}
+    for name in cfg.all_node_names():
+        results[name] = _call(cfg, "GET", name, "/status", verbose=args.verbose)
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0 if all(v is not None for v in results.values()) else 1
+
+    # Pretty-Print
+    print()
+    print(f"{'Node':<12} {'Status':<10}")
+    print("-" * 24)
+    for name, data in results.items():
+        status = "OK" if data else "NICHT ERREICHBAR"
+        print(f"{name:<12} {status:<10}")
+    print()
+
+    # Pro-VIP-Übersicht
+    # Sammele alle VIP-Namen
+    vip_names: set[str] = set(cfg.vips.keys())
+    for data in results.values():
+        if data:
+            for v in data.get("vips", []):
+                vip_names.add(v["name"])
+
+    if not vip_names:
+        return 1 if not all(v is not None for v in results.values()) else 0
+
+    header = f"{'VIP':<18} {'Floating IP':<18} {'Default':<10} {'Halter':<10} {'Health':<10}"
+    print(header)
+    print("-" * len(header))
+
+    for vip_name in sorted(vip_names):
+        default_master = cfg.vips.get(vip_name, {}).get("default_master", "?")
+        floating_ip = cfg.vips.get(vip_name, {}).get("floating_ip", "?")
+        holder = "?"
+        health = "?"
+        for node_name, data in results.items():
+            if not data:
+                continue
+            for v in data.get("vips", []):
+                if v["name"] != vip_name:
+                    continue
+                if v["holding"]:
+                    holder = node_name
+                    health = "OK" if v["local_check_ok"] else "FAIL"
+        # Marker, wenn nicht auf Default-Master
+        marker = ""
+        if holder != "?" and holder != default_master:
+            marker = " *"
+        print(f"{vip_name:<18} {floating_ip:<18} {default_master:<10} "
+              f"{holder:<10} {health:<10}{marker}")
+
+    print()
+    # Hinweise
+    not_reachable = [n for n, d in results.items() if d is None]
+    if not_reachable:
+        print(f"Nicht erreichbar: {', '.join(not_reachable)}")
+    marked = False
+    for vip_name in vip_names:
+        default_master = cfg.vips.get(vip_name, {}).get("default_master", "?")
+        for node_name, data in results.items():
+            if not data:
+                continue
+            for v in data.get("vips", []):
+                if v["name"] == vip_name and v["holding"] and node_name != default_master:
+                    marked = True
+    if marked:
+        print("* = VIP läuft nicht auf Default-Master")
+    print()
+
+    if not_reachable:
+        return 1
+    return 0
+
+
+def cmd_check(cfg: CtlConfig, args: argparse.Namespace) -> int:
+    """Manuellen Health-Check auf einer Node ausführen."""
+    target_node = args.node or cfg.node_name
+    result = _call(cfg, "POST", target_node, f"/vips/{args.vip}/check",
+                   verbose=args.verbose)
+    if result is None:
+        print(f"FEHLER: Check auf {target_node} fehlgeschlagen", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("overall_ok") else 1
+
+    print(f"VIP:                {result['vip']} ({result['floating_ip']})")
+    print(f"Node:               {target_node}")
+    print(f"IP am Interface:    {'ja' if result['ip_on_interface'] else 'NEIN'}")
+    print(f"HTTP-Check URL:     {result['check_url']}")
+    if result.get("check_host_header"):
+        print(f"Host-Header:        {result['check_host_header']}")
+    print(f"OK-Codes:           {result['check_ok_codes']}")
+    if result.get("check_expect_string"):
+        print(f"expect_string:      '{result['check_expect_string']}'")
+    print(f"HTTP-Check:         {'OK' if result['http_ok'] else 'FAIL'}")
+    if not result["http_ok"]:
+        print(f"  Grund:            {result['http_reason']}")
+    print(f"Gesamt:             {'OK' if result['overall_ok'] else 'FAIL'}")
+    return 0 if result["overall_ok"] else 1
+
+
+def cmd_release(cfg: CtlConfig, args: argparse.Namespace) -> int:
+    target_node = args.node or cfg.node_name
+    result = _call(cfg, "POST", target_node, f"/vips/{args.vip}/release",
+                   verbose=args.verbose)
+    if result is None:
+        print(f"FEHLER: Release auf {target_node} fehlgeschlagen", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"{target_node}: {result.get('action')} "
+              f"({result.get('reason', '')})")
+    return 0 if result.get("ok") else 1
+
+
+def cmd_takeover(cfg: CtlConfig, args: argparse.Namespace) -> int:
+    target_node = args.node or cfg.node_name
+    result = _call(cfg, "POST", target_node, f"/vips/{args.vip}/takeover",
+                   verbose=args.verbose)
+    if result is None:
+        print(f"FEHLER: Takeover auf {target_node} fehlgeschlagen", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"{target_node}: {result.get('action')} "
+              f"({result.get('reason', '')})")
+    return 0 if result.get("ok") else 1
+
+
+def cmd_failover(cfg: CtlConfig, args: argparse.Namespace) -> int:
+    """Geordnetes Umschalten:
+    1) Finde aktuellen Halter
+    2) Wenn Default-Master die VIP hält -> nichts zu tun (außer --to <node> gesetzt)
+    3) Sonst: aktueller Halter gibt frei
+       -> Default-Master übernimmt automatisch im nächsten Health-Loop
+    """
+    if args.vip not in cfg.vips:
+        print(f"FEHLER: VIP '{args.vip}' nicht in lokaler Config", file=sys.stderr)
+        return 2
+    default_master = cfg.vips[args.vip]["default_master"]
+    target = args.to or default_master
+
+    # Wer hält gerade?
+    holder = None
+    for name in cfg.all_node_names():
+        data = _call(cfg, "GET", name, "/status", verbose=args.verbose)
+        if not data:
+            continue
+        for v in data.get("vips", []):
+            if v["name"] == args.vip and v["holding"]:
+                holder = name
+                break
+        if holder:
+            break
+
+    if holder is None:
+        print(f"Niemand hält VIP '{args.vip}'. Versuche {target} zur Übernahme zu bewegen.")
+        result = _call(cfg, "POST", target, f"/vips/{args.vip}/takeover",
+                       verbose=args.verbose)
+        if result and result.get("ok"):
+            print(f"{target}: takeover ok")
+            return 0
+        print(f"FEHLER: Takeover auf {target} fehlgeschlagen", file=sys.stderr)
+        return 2
+
+    if holder == target:
+        print(f"VIP '{args.vip}' läuft bereits auf {target}. Nichts zu tun.")
+        return 0
+
+    print(f"VIP '{args.vip}' läuft auf {holder}, soll nach {target} wechseln.")
+    print(f"-> Release auf {holder} ...")
+    result = _call(cfg, "POST", holder, f"/vips/{args.vip}/release",
+                   verbose=args.verbose)
+    if not result or not result.get("ok"):
+        print(f"FEHLER: Release auf {holder} fehlgeschlagen", file=sys.stderr)
+        return 2
+
+    if args.to:
+        # Explizit auf eine bestimmte Node umschalten (nicht Default-Master)
+        # Kurz warten, damit das Release auch wirklich durch ist
+        import time
+        time.sleep(2)
+        print(f"-> Takeover auf {target} ...")
+        result = _call(cfg, "POST", target, f"/vips/{args.vip}/takeover",
+                       verbose=args.verbose)
+        if result and result.get("ok"):
+            print(f"{target}: takeover ok")
+            return 0
+        print(f"FEHLER: Takeover auf {target} fehlgeschlagen", file=sys.stderr)
+        return 2
+
+    print(f"Release ok. {target} (Default-Master) sollte beim nächsten Health-Loop "
+          f"übernehmen. Prüfe mit: vipctl status")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="vipctl",
+        description="CLI für vipd VIP Failover Daemon",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--config", default="/etc/vipd/vipd.yaml",
+                        help="Pfad zur vipd.yaml (Default: /etc/vipd/vipd.yaml)")
+    parser.add_argument("--json", action="store_true",
+                        help="Output als JSON")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Mehr Details (HTTP-Calls auf stderr)")
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="Status aller Nodes + VIPs")
+    p_status.set_defaults(func=cmd_status)
+
+    p_check = sub.add_parser("check", help="Manueller Health-Check")
+    p_check.add_argument("vip", help="Name der VIP")
+    p_check.add_argument("--node", help="Auf dieser Node ausführen "
+                                        "(Default: lokal)")
+    p_check.set_defaults(func=cmd_check)
+
+    p_release = sub.add_parser("release", help="VIP lokal freigeben")
+    p_release.add_argument("vip", help="Name der VIP")
+    p_release.add_argument("--node", help="Auf dieser Node ausführen "
+                                          "(Default: lokal)")
+    p_release.set_defaults(func=cmd_release)
+
+    p_takeover = sub.add_parser("takeover", help="VIP übernehmen")
+    p_takeover.add_argument("vip", help="Name der VIP")
+    p_takeover.add_argument("--node", help="Diese Node soll übernehmen "
+                                           "(Default: lokal)")
+    p_takeover.set_defaults(func=cmd_takeover)
+
+    p_failover = sub.add_parser("failover",
+                                 help="Geordnetes Umschalten zum Default-Master")
+    p_failover.add_argument("vip", help="Name der VIP")
+    p_failover.add_argument("--to", help="Ziel-Node (Default: Default-Master)")
+    p_failover.set_defaults(func=cmd_failover)
+
+    args = parser.parse_args()
+
+    try:
+        cfg = CtlConfig(args.config)
+    except FileNotFoundError as e:
+        print(f"FEHLER: {e}", file=sys.stderr)
+        return 2
+    except KeyError as e:
+        print(f"FEHLER: Pflichtfeld fehlt in Config: {e}", file=sys.stderr)
+        return 2
+
+    return args.func(cfg, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
