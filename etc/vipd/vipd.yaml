@@ -1,0 +1,71 @@
+# vipd Konfiguration
+# Liegt in /etc/vipd/vipd.yaml, deployed via GitLab-Pipeline pro Node
+#
+# Dieses Beispiel zeigt Node "lb01" einer HLNUG-Umgebung mit nginx.
+# Für animate-Umgebung: service: traefik
+
+node_name: proxyfs01
+
+# HTTPS-API für Peer-Kommunikation und Icinga
+listen_address: 0.0.0.0
+listen_port: 8443
+
+# Health-Loop-Intervall (Sekunden)
+check_interval_seconds: 5
+
+# Timeout für Peer-HTTPS-Calls
+peer_timeout_seconds: 3.0
+
+# Pfade für TLS und Secrets
+secrets_file: /etc/vipd/secrets
+cert_file: /etc/vipd/cert.pem
+key_file: /etc/vipd/key.pem
+ca_file: /etc/vipd/ca.pem
+
+# Liste der Peer-Nodes (alle anderen, nicht diese hier)
+peers:
+  - name: proxynb01
+    internal_ip: 10.1.0.3
+    external_ip: 46.224.25.210
+
+# Liste der VIPs, die diese Node-Gruppe verwaltet
+# WICHTIG: identische Liste auf allen Peers, nur node_name unterscheidet sich
+vips:
+  - name: web-vip
+    floating_ip: 195.201.251.226
+    floating_ip_id: 121665981
+    default_master: proxynb01           # Hostname (entspricht node_name auf der Master-Node)
+    interface: eth0
+    service: nginx                  # systemd-Service
+
+    # HTTP-Health-Check (lokal gegen 127.0.0.1:check_port)
+    check_port: 443
+    check_scheme: https             # "http" oder "https"
+    check_path: /                   # URL-Pfad
+    check_host_header: www.hlnug-hessen.de # Optional: Host-Header (wichtig bei nginx mit vhosts)
+    check_ok_codes: [200]           # Liste erlaubter Status-Codes
+#   check_expect_string: "OK"       # Optional: Substring der im Body vorkommen MUSS
+                                    # Wenn leer / weggelassen: nur Status-Code wird geprüft
+    check_timeout_seconds: 3.0
+
+    # Service-Recovery: Wie oft systemctl restart vor Failover?
+    restart_attempts: 1
+    restart_wait_seconds: 10
+
+  # Beispiel für zweite VIP mit anderem Default-Master (Lastverteilung)
+  # und nur Status-Code-Check ohne expect_string
+  # - name: api-vip
+  #   floating_ip: 195.201.251.227
+  #   floating_ip_id: 121665982
+  #   default_master: lb02
+  #   interface: eth0
+  #   service: nginx
+  #   check_port: 443
+  #   check_scheme: https
+  #   check_path: /api/v1/health
+  #   check_host_header: api.example.com
+  #   check_ok_codes: [200, 204]
+  #   # check_expect_string: weggelassen -> nur Status-Code
+  #   check_timeout_seconds: 3.0
+  #   restart_attempts: 1
+  #   restart_wait_seconds: 10
