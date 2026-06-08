@@ -103,7 +103,7 @@ cd /opt/vipd
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 2. Wrapper für vipctl
-bashcat > /usr/local/bin/vipctl <<'EOF'
+cat > /usr/local/bin/vipctl <<'EOF'
 #!/bin/sh
 exec /opt/vipd/venv/bin/python /opt/vipd/vipctl "$@"
 EOF
