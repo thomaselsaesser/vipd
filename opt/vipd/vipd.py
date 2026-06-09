@@ -691,10 +691,22 @@ class StatusResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startet die Health-Loop beim API-Start."""
+    """Startet die Health-Loop beim API-Start und raeumt beim Stoppen auf."""
     task = asyncio.create_task(health_loop())
     yield
+    # Shutdown: Health-Loop stoppen ...
     task.cancel()
+    # ... und alle VIP-IPs vom Interface abraeumen. Bewusste Design-Entscheidung:
+    # Wenn vipd gestoppt wird, gibt dieser Node die VIP vollstaendig auf
+    # (kurzes Flackern bei Restart wird in Kauf genommen), damit ein laufender
+    # Peer sauber uebernehmen kann und keine verwaiste Interface-IP zurueckbleibt.
+    if CONFIG is not None:
+        for vip in CONFIG.vips:
+            if ip_on_interface(vip.floating_ip, vip.interface):
+                log.info("Shutdown: raeume VIP %s (%s) von %s ab",
+                         vip.name, vip.floating_ip, vip.interface)
+                del_ip_from_interface(vip.floating_ip, vip.interface)
+                VIP_STATES[vip.name].holding = False
 
 
 app = FastAPI(lifespan=lifespan)
