@@ -248,24 +248,64 @@ def restart_service(service: str) -> bool:
 # Hetzner API + lokales Interface-Handling
 # ---------------------------------------------------------------------------
 async def hetzner_assign_floating_ip(vip: VipConfig, server_id: int) -> bool:
-    """Hängt die Floating IP auf den Server mit der gegebenen ID um."""
+    """Hängt die Floating IP auf den Server mit der gegebenen ID um.
+
+    Bei HTTP 423 (Locked) laeuft auf der FIP noch eine andere Action -> kurz
+    warten und erneut versuchen (Fix fuer Race beim schnellen Umschalten).
+    """
     url = f"https://api.hetzner.cloud/v1/floating_ips/{vip.floating_ip_id}/actions/assign"
     headers = {
         "Authorization": f"Bearer {CONFIG.hetzner_token}",
         "Content-Type": "application/json",
     }
+    max_attempts = 4
+    backoff = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(url, headers=headers, json={"server": server_id})
+                if r.status_code in (200, 201):
+                    log.info("Hetzner API: Floating IP %s -> Server %d ok",
+                             vip.floating_ip, server_id)
+                    return True
+                if r.status_code == 423 and attempt < max_attempts:
+                    log.warning("Hetzner API 423 Locked (Versuch %d/%d) -> "
+                                "warte %.1fs und retry", attempt, max_attempts, backoff)
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                log.error("Hetzner API Fehler %d: %s", r.status_code, r.text)
+                return False
+        except httpx.HTTPError as e:
+            log.error("Hetzner API Exception: %s", e)
+            return False
+    log.error("Hetzner API: Floating IP %s nach %d Versuchen weiter gelockt",
+              vip.floating_ip, max_attempts)
+    return False
+
+
+async def hetzner_get_assigned_server(vip: VipConfig) -> Optional[int]:
+    """Fragt bei Hetzner ab, welchem Server die Floating IP aktuell zugewiesen ist.
+
+    Returns:
+        int   -> Server-ID, der die FIP laut Hetzner gehoert
+        None  -> FIP ist aktuell keinem Server zugewiesen
+        -1    -> Hetzner-API nicht erreichbar / Fehler (Aufrufer darf NICHT
+                 blind handeln, sondern muss konservativ entscheiden)
+    """
+    url = f"https://api.hetzner.cloud/v1/floating_ips/{vip.floating_ip_id}"
+    headers = {"Authorization": f"Bearer {CONFIG.hetzner_token}"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(url, headers=headers, json={"server": server_id})
-            if r.status_code in (200, 201):
-                log.info("Hetzner API: Floating IP %s -> Server %d ok",
-                         vip.floating_ip, server_id)
-                return True
-            log.error("Hetzner API Fehler %d: %s", r.status_code, r.text)
-            return False
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                # "server" ist die Server-ID (int) oder null
+                return r.json().get("floating_ip", {}).get("server")
+            log.error("Hetzner API GET Fehler %d: %s", r.status_code, r.text)
+            return -1
     except httpx.HTTPError as e:
-        log.error("Hetzner API Exception: %s", e)
-        return False
+        log.error("Hetzner API GET Exception: %s", e)
+        return -1
 
 
 def get_own_server_id() -> Optional[int]:
@@ -398,6 +438,75 @@ async def peer_holds_vip(peer: PeerConfig, vip_name: str) -> Optional[bool]:
     return False
 
 
+async def peer_has_ip_on_interface(peer: PeerConfig, vip_name: str) -> Optional[bool]:
+    """Fragt einen Peer, ob er die VIP TATSAECHLICH am Interface hat
+    (unabhaengig von seinem holding-State).
+    Returns None wenn Peer nicht erreichbar ODER das Feld nicht liefert
+    (alte vipd-Version -> abwaertskompatibel, keine Konfliktentscheidung)."""
+    status = await peer_get_status(peer.internal_ip)
+    if status is None:
+        status = await peer_get_status(peer.external_ip)
+    if status is None:
+        return None
+    for v in status.get("vips", []):
+        if v["name"] == vip_name:
+            # Feld fehlt bei alter Peer-Version -> None (nicht entscheiden)
+            return v.get("ip_present_on_interface", None)
+    return None
+
+
+async def resolve_ip_conflict(vip: VipConfig) -> None:
+    """Wird nur aufgerufen, wenn lokal UND beim Peer die IP am Interface haengt
+    (Doppelbelegung erkannt). Fragt Hetzner als Schiedsrichter, wem die FIP
+    wirklich gehoert, und raeumt auf der Verlierer-Seite die lokale IP ab.
+
+    Konservativ bei Hetzner-Ausfall: dann raeumt der Nicht-Default-Master ab.
+    """
+    state = VIP_STATES[vip.name]
+    assigned = await hetzner_get_assigned_server(vip)
+    own_id = get_own_server_id()
+
+    if assigned == -1:
+        # Hetzner-API nicht erreichbar -> konservativ:
+        # Default-Master behaelt, der andere raeumt ab.
+        if vip.default_master != CONFIG.node_name:
+            log.warning("VIP %s: Doppelbelegung + Hetzner-API tot -> ich (kein "
+                        "Default-Master) raeume lokale IP ab", vip.name)
+            del_ip_from_interface(vip.floating_ip, vip.interface)
+            state.holding = False
+        else:
+            log.warning("VIP %s: Doppelbelegung + Hetzner-API tot -> ich "
+                        "(Default-Master) behalte die IP", vip.name)
+        return
+
+    if assigned is None:
+        # FIP haengt laut Hetzner nirgends -> der Default-Master nimmt sie
+        # sauber, der andere raeumt ab.
+        if vip.default_master == CONFIG.node_name:
+            log.warning("VIP %s: Doppelbelegung, FIP bei Hetzner nicht zugewiesen "
+                        "-> ich (Default-Master) weise mir neu zu", vip.name)
+            await take_over_vip(vip)
+        else:
+            log.warning("VIP %s: Doppelbelegung, FIP bei Hetzner nicht zugewiesen "
+                        "-> ich raeume ab, Default-Master uebernimmt", vip.name)
+            del_ip_from_interface(vip.floating_ip, vip.interface)
+            state.holding = False
+        return
+
+    # Hetzner hat eine klare Antwort: wem gehoert die FIP?
+    if assigned == own_id:
+        log.warning("VIP %s: Doppelbelegung - Hetzner sagt FIP gehoert mir (%s), "
+                    "ich behalte, Peer muss abraeumen", vip.name, own_id)
+        if not ip_on_interface(vip.floating_ip, vip.interface):
+            add_ip_to_interface(vip.floating_ip, vip.interface)
+        state.holding = True
+    else:
+        log.warning("VIP %s: Doppelbelegung - Hetzner sagt FIP gehoert Server %s, "
+                    "nicht mir (%s) -> lokale IP abraeumen", vip.name, assigned, own_id)
+        del_ip_from_interface(vip.floating_ip, vip.interface)
+        state.holding = False
+
+
 # ---------------------------------------------------------------------------
 # Health-Check + Entscheidungs-Loop
 # ---------------------------------------------------------------------------
@@ -437,6 +546,16 @@ async def handle_vip_as_master(vip: VipConfig) -> None:
     """Entscheidungslogik wenn wir die VIP halten."""
     state = VIP_STATES[vip.name]
 
+    # Konflikt-Check (billig): Haelt der Peer die IP AUCH am Interface?
+    # Nur dann (Doppelbelegung) wird Hetzner als Schiedsrichter befragt.
+    for peer in CONFIG.peers:
+        peer_has = await peer_has_ip_on_interface(peer, vip.name)
+        if peer_has is True and ip_on_interface(vip.floating_ip, vip.interface):
+            log.warning("VIP %s: Doppelbelegung erkannt (auch Peer %s haelt die IP "
+                        "am Interface) -> Hetzner-Schiedsspruch", vip.name, peer.name)
+            await resolve_ip_conflict(vip)
+            return
+
     # Prüfen, ob IP wirklich am Interface ist; falls nicht, wieder zuweisen
     if not ip_on_interface(vip.floating_ip, vip.interface):
         log.warning("VIP %s sollte hier hängen, ist aber weg – neu zuweisen",
@@ -467,6 +586,18 @@ async def handle_vip_as_backup(vip: VipConfig) -> None:
     # Fall 1: Wir sind Default-Master und die VIP läuft woanders -> nichts tun
     #         (kein Preemption). Icinga warnt.
     # Fall 2: Wir sind Backup -> prüfen ob Master noch lebt.
+
+    # Sicherheits-Check: Wir gelten als Backup (holding=False), haben die IP
+    # aber TROTZDEM am Interface (verwaiste IP nach Failover, Bug-2-Fall) und
+    # der Peer haelt sie auch -> Doppelbelegung aufloesen.
+    if ip_on_interface(vip.floating_ip, vip.interface):
+        for peer in CONFIG.peers:
+            peer_has = await peer_has_ip_on_interface(peer, vip.name)
+            if peer_has is True:
+                log.warning("VIP %s: lokale IP am Interface obwohl Backup, und Peer %s "
+                            "haelt sie auch -> Hetzner-Schiedsspruch", vip.name, peer.name)
+                await resolve_ip_conflict(vip)
+                return
 
     # Wer hält die VIP gerade laut Peers?
     holder_found = False
@@ -550,6 +681,7 @@ class VipStatusResponse(BaseModel):
     is_default_master: bool
     last_error: str
     last_check_age_seconds: float
+    ip_present_on_interface: bool = False  # tatsaechliche Interface-Realitaet
 
 
 class StatusResponse(BaseModel):
@@ -585,6 +717,7 @@ async def get_status(_: None = Depends(verify_auth)) -> StatusResponse:
             last_error=s.last_error,
             last_check_age_seconds=now - s.last_check_timestamp
             if s.last_check_timestamp > 0 else -1.0,
+            ip_present_on_interface=ip_on_interface(v.floating_ip, v.interface),
         ))
     return StatusResponse(node=CONFIG.node_name, vips=vips)
 
