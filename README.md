@@ -10,7 +10,7 @@ lokal aufs Interface.
 - **Pro VIP konfigurierbarer Default-Master** – jeder VIP hat genau eine
   "Heimat-Node", die ihn standardmäßig hält.
 - **Kein Preemption** – wenn ein Default-Master nach Ausfall wieder kommt,
-  bleibt die VIP beim aktuellen Halter. Icinga zeigt eine Warnung.
+  bleibt die VIP beim aktuellen Halter.
 - **Lokale Health-Checks** – IP am Interface + HTTP-Check (Status-Code-Liste, optional
   Substring-Match im Body, optional Host-Header).
 - **Service-Recovery vor Failover** – nginx/traefik wird erst neu gestartet
