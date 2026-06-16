@@ -1,6 +1,6 @@
 # vipd – VIP Failover Daemon
 
-Verwaltet Hetzner Cloud Floating IPs zwischen zwei oder mehr Load-Balancer-Nodes
+Verwaltet Hetzner Cloud Floating IPs zwischen zwei oder mehr Nodes
 ohne keepalived/VRRP (das bei Hetzner nicht funktioniert). Steuert die
 Floating-IP-Zuweisung über die Hetzner Cloud API und legt die IP zusätzlich
 lokal aufs Interface.
