@@ -366,9 +366,9 @@ systemctl stop vipd
 
 cat failover.sh 
 #!/bin/bash
-FLOATING_IP_ID="121665981"
-HETZNER_TOKEN="UeZIZrC4SB4B40fWxtjvYJmCqpRaMf6RX3ziT3kak14KGAZ3UxMjGHWjncNcQAy3"
-FLOATING_IP="195.201.251.226"
+FLOATING_IP_ID="123123123123"
+HETZNER_TOKEN="abcabcabc"
+FLOATING_IP="195.201.251.2"
 SERVER_ID="$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id)"
 
 case "$1" in
